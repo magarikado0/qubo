@@ -19,10 +19,21 @@ from sklearn.linear_model import LinearRegression
 from itertools import product
 import neal
 
+
+def build_black_box_params(n_vars: int, rng: np.random.Generator, interaction_density: float = 0.15):
+    """Create a reproducible quadratic cost with linear and pairwise terms."""
+    weights = rng.uniform(-2.5, 2.5, size=n_vars)
+    interactions = {}
+    for i in range(n_vars):
+        for j in range(i + 1, n_vars):
+            if rng.random() < interaction_density:
+                interactions[(i, j)] = rng.uniform(-3.0, 3.0)
+    return weights, interactions
+
 # --------------------------------------------------
 # 1. 元の評価関数 (ブラックボックスを想定)
 # --------------------------------------------------
-def black_box(x: np.ndarray) -> float:
+def black_box(x: np.ndarray, weights: np.ndarray, interactions: dict[tuple[int, int], float]) -> float:
     """
     バイナリベクトル x に対する目的関数 (最小化したい)。
     実際のユースケースでは外部シミュレータ等から得る値。
@@ -30,13 +41,6 @@ def black_box(x: np.ndarray) -> float:
     """
     n = len(x)
     cost = 0.0
-    weights = [3.0, 5.0, 2.0, 4.0]   # 1次係数
-    interactions = {                    # 2次相互作用
-        (0, 1): -6.0,
-        (0, 2):  3.0,
-        (1, 3): -4.0,
-        (2, 3):  2.0,
-    }
     for i, w in enumerate(weights[:n]):
         cost += w * x[i]
     for (i, j), c in interactions.items():
@@ -44,21 +48,24 @@ def black_box(x: np.ndarray) -> float:
             cost += c * x[i] * x[j]
     return cost
 
-n_vars = 4   # バイナリ変数の数
+n_vars = 20   # バイナリ変数の数（例: 20）
 
 # --------------------------------------------------
 # 2. ランダムサンプリングで学習データ生成
 # --------------------------------------------------
-np.random.seed(42)
-n_samples = 60
+rng = np.random.default_rng(42)
+weights, interactions = build_black_box_params(n_vars, rng)
+
+n_samples = 400
 X_train = np.random.randint(0, 2, size=(n_samples, n_vars)).astype(float)
-y_train = np.array([black_box(row) for row in X_train])
+y_train = np.array([black_box(row, weights, interactions) for row in X_train])
 
 print("=" * 55)
 print("  代理モデル係数 → QUBO 変換 (Surrogate-to-QUBO)")
 print("=" * 55)
 print(f"変数数     : {n_vars}")
 print(f"学習サンプル: {n_samples} 点")
+print(f"相互作用数 : {len(interactions)}")
 
 # --------------------------------------------------
 # 3. 二次回帰で代理モデルを学習
@@ -122,7 +129,11 @@ for fname, c in zip(feature_names, coef):
 print("\nQUBO 行列 (非ゼロ要素):")
 print(f"{'要素':<20} {'係数':>10}")
 print("-" * 32)
-for (i, j), v in sorted(qubo.items()):
+max_print_terms = 60
+for idx, ((i, j), v) in enumerate(sorted(qubo.items())):
+    if idx >= max_print_terms:
+        print(f"  ... ({len(qubo) - max_print_terms} 要素を省略)")
+        break
     print(f"  ({i}, {j}){'':<10} {v:>10.4f}")
 
 # --------------------------------------------------
@@ -138,34 +149,49 @@ response = sampler.sample(bqm, num_reads=2000, num_sweeps=2000)
 
 best_sample = dict(response.first.sample)
 best_x = np.array([best_sample.get(f"x{i}", 0) for i in range(n_vars)])
-sa_cost = black_box(best_x)
+sa_cost = black_box(best_x, weights, interactions)
 
 print(f"\nSA が選んだ解: x = {best_x.astype(int).tolist()}")
 print(f"  → 真のコスト: {sa_cost:.4f}")
 
 # --------------------------------------------------
-# 6. 全探索で最適解確認
+# 6. 全探索で最適解確認（高次元では計算量が爆発するため条件付き）
 # --------------------------------------------------
-all_x    = np.array(list(product([0, 1], repeat=n_vars)))
-all_cost = np.array([black_box(row) for row in all_x])
-opt_idx  = np.argmin(all_cost)
-opt_x    = all_x[opt_idx]
-opt_cost = all_cost[opt_idx]
+all_x = None
+all_cost = None
+if n_vars <= 20:
+    all_x = np.array(list(product([0, 1], repeat=n_vars)))
+    all_cost = np.array([black_box(row, weights, interactions) for row in all_x])
+    opt_idx  = np.argmin(all_cost)
+    opt_x    = all_x[opt_idx]
+    opt_cost = all_cost[opt_idx]
 
-print(f"\n全探索の最適解: x = {opt_x.astype(int).tolist()}")
-print(f"  → 最適コスト: {opt_cost:.4f}")
+    print(f"\n全探索の最適解: x = {opt_x.astype(int).tolist()}")
+    print(f"  → 最適コスト: {opt_cost:.4f}")
 
-gap = abs(sa_cost - opt_cost) / (abs(opt_cost) + 1e-12) * 100
-print(f"\nGap from optimal: {gap:.2f}%")
-if gap < 1.0:
-    print("  → 代理モデル経由でも全探索と同じ最適解に到達しました！")
+    gap = abs(sa_cost - opt_cost) / (abs(opt_cost) + 1e-12) * 100
+    print(f"\nGap from optimal: {gap:.2f}%")
+    if gap < 1.0:
+        print("  → 代理モデル経由でも全探索と同じ最適解に到達しました！")
+    else:
+        print("  → 差異あり。サンプル数や正則化を調整してみてください。")
 else:
-    print(f"  → 差異あり。サンプル数や正則化を調整してみてください。")
+    print("\n全探索はスキップ: 2^n が大きすぎるため (n > 20)")
+    random_trials = 50000
+    random_x = rng.integers(0, 2, size=(random_trials, n_vars))
+    random_cost = np.array([black_box(row, weights, interactions) for row in random_x])
+    best_random_idx = int(np.argmin(random_cost))
+    best_random_cost = float(random_cost[best_random_idx])
+    print(f"ランダム探索({random_trials}点) の最良コスト: {best_random_cost:.4f}")
+    print(f"SA 改善量 (random_best - sa_cost): {best_random_cost - sa_cost:.4f}")
 
 # --------------------------------------------------
 # 7. 結果サマリを DataFrame で表示
 # --------------------------------------------------
 print("\n--- 全探索コスト一覧 (上位 10 件) ---")
-df = pd.DataFrame(all_x, columns=[f"x{i}" for i in range(n_vars)])
-df["cost"] = all_cost
-print(df.nsmallest(10, "cost").to_string(index=False))
+if all_x is not None and all_cost is not None:
+    df = pd.DataFrame(all_x, columns=[f"x{i}" for i in range(n_vars)])
+    df["cost"] = all_cost
+    print(df.nsmallest(10, "cost").to_string(index=False))
+else:
+    print("n > 20 のため省略（全探索未実施）")
